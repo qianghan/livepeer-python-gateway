@@ -1,0 +1,12 @@
+services:
+  livepeer-gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ORCHESTRATOR_URL=${ORCHESTRATOR_URL:-}
+      - SIGNER_URL=${SIGNER_URL:-}
+      - LIVEPEER_TOKEN=${LIVEPEER_TOKEN:-}
+      - DEFAULT_MODEL_ID=${DEFAULT_MODEL_ID:-noop}
+      - FPS=${FPS:-24}
+      - JPEG_QUALITY=${JPEG_QUALITY:-80}

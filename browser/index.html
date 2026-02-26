@@ -138,6 +138,10 @@
     <label>Orchestrator URL (optional)</label>
     <input id="orch-url" type="text" value="" placeholder="host:port">
   </div>
+  <div class="config-field">
+    <label>API Key (optional)</label>
+    <input id="api-key" type="password" value="" placeholder="Leave empty if auth disabled">
+  </div>
   <div class="buttons">
     <button id="btn-start">Start</button>
     <button id="btn-stop" disabled>Stop</button>
@@ -195,6 +199,7 @@
   const serverUrlInput = document.getElementById('server-url');
   const modelIdInput = document.getElementById('model-id');
   const orchUrlInput = document.getElementById('orch-url');
+  const apiKeyInput = document.getElementById('api-key');
   const btnStart = document.getElementById('btn-start');
   const btnStop = document.getElementById('btn-stop');
   const inputCanvas = document.getElementById('input-canvas');
@@ -313,9 +318,13 @@
     log('Starting job...');
     setStatus('connecting', 'Starting job...');
 
+    const headers = { 'Content-Type': 'application/json' };
+    const apiKey = apiKeyInput.value.trim();
+    if (apiKey) headers['X-API-Key'] = apiKey;
+
     const resp = await fetch(url + '/start-job', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headers,
       body: JSON.stringify(body),
     });
 
@@ -334,7 +343,10 @@
     if (!jobId) return;
     const url = getServerUrl();
     try {
-      await fetch(url + '/stop-job/' + jobId, { method: 'DELETE' });
+      const headers = {};
+      const apiKey = apiKeyInput.value.trim();
+      if (apiKey) headers['X-API-Key'] = apiKey;
+      await fetch(url + '/stop-job/' + jobId, { method: 'DELETE', headers: headers });
       log('Job stopped: ' + jobId);
     } catch (err) {
       log('Error stopping job: ' + err.message);
@@ -343,8 +355,10 @@
   }
 
   function connectWebSocket() {
-    const wsUrl = getWsUrl() + '/ws/stream?job_id=' + jobId;
-    log('Connecting WebSocket: ' + wsUrl);
+    let wsUrl = getWsUrl() + '/ws/stream?job_id=' + jobId;
+    const apiKey = apiKeyInput.value.trim();
+    if (apiKey) wsUrl += '&api_key=' + encodeURIComponent(apiKey);
+    log('Connecting WebSocket: ' + wsUrl.replace(/api_key=[^&]+/, 'api_key=***'));
     setStatus('connecting', 'Connecting...');
 
     ws = new WebSocket(wsUrl);

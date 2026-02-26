@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import time
 import uuid
@@ -19,25 +20,41 @@ from pathlib import Path
 from typing import Optional
 
 import av
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from starlette.responses import StreamingResponse
 
 from livepeer_gateway.lv2v import LiveVideoToVideo, StartJobRequest, start_lv2v
 from livepeer_gateway.media_publish import MediaPublishConfig
 
+from .auth import get_api_key_dependency, get_ws_api_key_dependency
 from .config import Config
+from .models import (
+    ControlMessageBody,
+    HealthResponse,
+    JobListItem,
+    JobStatusResponse,
+    StartJobRequestBody,
+    StartJobResponse,
+)
 
 _LOG = logging.getLogger(__name__)
 _TIME_BASE = 90_000
+_VERSION = "1.0.0"
 
 config = Config()
+
+# Build auth dependencies from config.
+verify_api_key = get_api_key_dependency(config)
+verify_ws_api_key = get_ws_api_key_dependency(config)
 
 # ---------------------------------------------------------------------------
 # Job state
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class JobState:
@@ -46,6 +63,7 @@ class JobState:
     job: LiveVideoToVideo
     created_at: float = field(default_factory=time.time)
     orchestrator_url: Optional[str] = None
+    api_key: Optional[str] = None
     _media_started: bool = False
 
 
@@ -55,7 +73,7 @@ _jobs: dict[str, JobState] = {}
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Livepeer Gateway Web Wrapper")
+app = FastAPI(title="Livepeer Gateway API", version=_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,8 +89,44 @@ if _BROWSER_DIR.is_dir():
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Shutdown handler — close all active jobs on SIGTERM (Cloud Run)
 # ---------------------------------------------------------------------------
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    _LOG.info("Shutting down — closing %d active job(s)", len(_jobs))
+    tasks = []
+    for state in list(_jobs.values()):
+        tasks.append(_close_job(state))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _jobs.clear()
+
+
+async def _close_job(state: JobState) -> None:
+    try:
+        await state.job.close()
+    except Exception:
+        _LOG.exception("Error closing job %s during shutdown", state.job_id)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _jobs_for_key(api_key: Optional[str]) -> int:
+    """Count active jobs owned by a given API key."""
+    if api_key is None:
+        return 0
+    return sum(1 for s in _jobs.values() if s.api_key == api_key)
+
+
+# ---------------------------------------------------------------------------
+# Public routes (no auth)
+# ---------------------------------------------------------------------------
+
 
 @app.get("/")
 async def index():
@@ -82,17 +136,51 @@ async def index():
     return JSONResponse({"error": "Browser app not found"}, status_code=404)
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health():
-    return {"status": "ok", "active_jobs": len(_jobs)}
+    return HealthResponse(active_jobs=len(_jobs), version=_VERSION)
 
 
-@app.post("/start-job")
-async def start_job(body: dict = {}):
-    model_id = body.get("model_id") or config.default_model_id
-    orch_url = body.get("orchestrator_url") or config.orchestrator_url
+# ---------------------------------------------------------------------------
+# Authenticated routes
+# ---------------------------------------------------------------------------
 
-    req = StartJobRequest(model_id=model_id)
+
+@app.get("/jobs", response_model=list[JobListItem])
+async def list_jobs(api_key: Optional[str] = Depends(verify_api_key)):
+    return [
+        JobListItem(
+            job_id=s.job_id,
+            model_id=s.model_id,
+            created_at=s.created_at,
+            orchestrator_url=s.orchestrator_url,
+            media_started=s._media_started,
+        )
+        for s in _jobs.values()
+    ]
+
+
+@app.post("/start-job", response_model=StartJobResponse)
+async def start_job(
+    body: StartJobRequestBody = StartJobRequestBody(),
+    api_key: Optional[str] = Depends(verify_api_key),
+):
+    # Per-key job limit.
+    if api_key and _jobs_for_key(api_key) >= config.max_jobs_per_key:
+        return JSONResponse(
+            {"error": f"Job limit reached ({config.max_jobs_per_key} per key)"},
+            status_code=429,
+        )
+
+    model_id = body.model_id or config.default_model_id
+    orch_url = body.orchestrator_url or config.orchestrator_url
+
+    req = StartJobRequest(
+        model_id=model_id,
+        params=body.params,
+        request_id=body.request_id,
+        stream_id=body.stream_id,
+    )
 
     try:
         job = await asyncio.to_thread(
@@ -100,7 +188,7 @@ async def start_job(body: dict = {}):
             orch_url,
             req,
             token=config.livepeer_token,
-            signer_url=config.signer_url,
+            signer_url=config.effective_signer_url,
         )
     except Exception as e:
         _LOG.exception("Failed to start job")
@@ -112,32 +200,48 @@ async def start_job(body: dict = {}):
         model_id=model_id,
         job=job,
         orchestrator_url=orch_url,
+        api_key=api_key,
     )
 
     _LOG.info("Started job %s (model=%s)", job_id, model_id)
-    return {
-        "job_id": job_id,
-        "model_id": model_id,
-        "publish_url": job.publish_url,
-        "subscribe_url": job.subscribe_url,
-    }
+    return StartJobResponse(
+        job_id=job_id,
+        model_id=model_id,
+        publish_url=job.publish_url,
+        subscribe_url=job.subscribe_url,
+        control_url=job.control_url,
+        events_url=job.events_url,
+    )
 
 
-@app.get("/job/{job_id}")
-async def get_job(job_id: str):
+@app.get("/job/{job_id}", response_model=JobStatusResponse)
+async def get_job(
+    job_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+):
     state = _jobs.get(job_id)
     if not state:
         return JSONResponse({"error": "Job not found"}, status_code=404)
-    return {
-        "job_id": state.job_id,
-        "model_id": state.model_id,
-        "created_at": state.created_at,
-        "orchestrator_url": state.orchestrator_url,
-    }
+    job = state.job
+    return JobStatusResponse(
+        job_id=state.job_id,
+        model_id=state.model_id,
+        created_at=state.created_at,
+        orchestrator_url=state.orchestrator_url,
+        publish_url=job.publish_url,
+        subscribe_url=job.subscribe_url,
+        control_url=job.control_url,
+        events_url=job.events_url,
+        has_payment_session=job._payment_session is not None,
+        media_started=state._media_started,
+    )
 
 
 @app.delete("/stop-job/{job_id}")
-async def stop_job(job_id: str):
+async def stop_job(
+    job_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+):
     state = _jobs.pop(job_id, None)
     if not state:
         return JSONResponse({"error": "Job not found"}, status_code=404)
@@ -151,8 +255,83 @@ async def stop_job(job_id: str):
     return {"status": "stopped", "job_id": job_id}
 
 
+@app.post("/job/{job_id}/control")
+async def send_control(
+    job_id: str,
+    body: ControlMessageBody,
+    api_key: Optional[str] = Depends(verify_api_key),
+):
+    state = _jobs.get(job_id)
+    if not state:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    control = state.job.control
+    if not control:
+        return JSONResponse(
+            {"error": "Job has no control channel"}, status_code=400
+        )
+
+    try:
+        await control.write_control(body.message)
+    except Exception as e:
+        _LOG.exception("Failed to send control message for job %s", job_id)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    return {"status": "sent", "job_id": job_id}
+
+
+@app.get("/job/{job_id}/events")
+async def stream_events(
+    job_id: str,
+    api_key: Optional[str] = Depends(verify_api_key),
+):
+    """SSE endpoint that streams job events."""
+    state = _jobs.get(job_id)
+    if not state:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    events = state.job.events
+    if not events:
+        return JSONResponse(
+            {"error": "Job has no events channel"}, status_code=400
+        )
+
+    async def event_generator():
+        try:
+            async for event in events():
+                data = json.dumps(event)
+                yield f"data: {data}\n\n"
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOG.debug("Events stream ended for job %s", job_id, exc_info=True)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — bidirectional JPEG streaming
+# ---------------------------------------------------------------------------
+
+
 @app.websocket("/ws/stream")
-async def ws_stream(ws: WebSocket, job_id: str):
+async def ws_stream(
+    ws: WebSocket,
+    job_id: str,
+    api_key: Optional[str] = Depends(verify_ws_api_key),
+):
+    # Reject if auth failed (WebSocket deps can't raise HTTPException).
+    if api_key == "__REJECT__":
+        await ws.close(code=4001, reason="Invalid or missing API key")
+        return
+
     state = _jobs.get(job_id)
     if not state:
         await ws.close(code=4004, reason="Job not found")

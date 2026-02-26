@@ -2,7 +2,7 @@ services:
   livepeer-gateway:
     build: .
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:8000"
     environment:
       - ORCHESTRATOR_URL=${ORCHESTRATOR_URL:-}
       - SIGNER_URL=${SIGNER_URL:-}
@@ -10,3 +10,13 @@ services:
       - DEFAULT_MODEL_ID=${DEFAULT_MODEL_ID:-noop}
       - FPS=${FPS:-24}
       - JPEG_QUALITY=${JPEG_QUALITY:-80}
+      - API_KEYS=${API_KEYS:-}
+      - MAX_JOBS_PER_KEY=${MAX_JOBS_PER_KEY:-10}
+      - DAYDREAM_URL=${DAYDREAM_URL:-}
+      - PORT=8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

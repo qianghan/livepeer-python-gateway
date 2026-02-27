@@ -13,9 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 COPY pyproject.toml ./
 COPY src/ src/
-RUN pip install --no-cache-dir --prefix=/install . fastapi uvicorn[standard] python-multipart pillow
+RUN pip install --no-cache-dir . fastapi uvicorn[standard] python-multipart pillow protobuf
 
 # ---- Runtime stage ----
 FROM python:3.12-slim-bookworm
@@ -35,8 +38,9 @@ RUN useradd --create-home appuser
 
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /install /usr/local
+# Copy virtualenv from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application code
 COPY web/ web/

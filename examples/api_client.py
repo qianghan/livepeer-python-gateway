@@ -1,34 +1,34 @@
 """
 Sample client for the Livepeer Gateway serverless API.
 
-Demonstrates the full lifecycle of AI video inference via the HTTP/WebSocket API:
-  1. Health check
-  2. Start a job (with optional model params)
-  3. Stream webcam or synthetic frames over WebSocket
-  4. Receive AI-processed frames and save/display them
-  5. Send control messages mid-stream
-  6. Subscribe to SSE events
-  7. Stop the job and clean up
+This is a pure remote client — it only needs the gateway server URL.
+The server handles orchestrator selection, signing, and payments.
 
-Works against a local server or a remote Cloud Run deployment.
+Lifecycle:
+  1. Health check
+  2. Start a job (just specify model_id)
+  3. Stream frames over WebSocket (synthetic test pattern or webcam)
+  4. Receive AI-processed frames back
+  5. Optionally send control messages and subscribe to events
+  6. Stop the job
 
 Requirements:
-    pip install aiohttp pillow
+    pip install aiohttp pillow numpy
 
 Usage:
-    # Minimal — stream synthetic frames through the "noop" model:
-    python examples/api_client.py
+    # Stream 10s of test frames through the default model:
+    python examples/api_client.py --server https://my-gateway.run.app
 
-    # With webcam, custom model, and API key:
+    # Webcam + save output:
     python examples/api_client.py \\
         --server https://my-gateway.run.app \\
-        --api-key sk-abc123 \\
-        --model my-ai-model \\
-        --webcam \\
-        --save-output ./output_frames
+        --webcam --save-output ./output_frames
 
-    # Send control messages mid-stream:
-    python examples/api_client.py --control '{"prompt": "make it cyberpunk"}'
+    # Custom model, 30 FPS, 60 seconds, with control message:
+    python examples/api_client.py \\
+        --server https://my-gateway.run.app \\
+        --model my-ai-model --fps 30 --duration 60 \\
+        --control '{"prompt": "oil painting style"}'
 """
 
 from __future__ import annotations
@@ -38,13 +38,13 @@ import asyncio
 import io
 import json
 import logging
-import struct
 import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
+import numpy as np
 from PIL import Image
 
 logging.basicConfig(
@@ -69,20 +69,20 @@ def _headers(api_key: Optional[str]) -> dict[str, str]:
 
 
 def _synthetic_jpeg(seq: int, width: int = 640, height: int = 480) -> bytes:
-    """Generate a synthetic JPEG frame with a moving gradient.
+    """Generate a synthetic JPEG test frame using numpy (fast).
 
-    Useful when no webcam is available — the pattern changes each frame
-    so you can visually confirm the pipeline is working.
+    Produces a moving color gradient so you can visually confirm
+    the pipeline is processing and returning frames.
     """
-    img = Image.new("RGB", (width, height))
-    pixels = img.load()
-    offset = (seq * 4) % width
-    for y in range(height):
-        for x in range(width):
-            r = (x + offset) % 256
-            g = (y + seq * 2) % 256
-            b = (x + y + seq) % 256
-            pixels[x, y] = (r, g, b)
+    x = np.arange(width, dtype=np.uint8)
+    y = np.arange(height, dtype=np.uint8)
+    xv, yv = np.meshgrid(x, y)
+    offset = (seq * 4) % 256
+    r = ((xv.astype(np.uint16) + offset) % 256).astype(np.uint8)
+    g = ((yv.astype(np.uint16) + seq * 2) % 256).astype(np.uint8)
+    b = ((xv.astype(np.uint16) + yv.astype(np.uint16) + seq) % 256).astype(np.uint8)
+    rgb = np.stack([r, g, b], axis=-1)
+    img = Image.fromarray(rgb, "RGB")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
     return buf.getvalue()
@@ -90,7 +90,7 @@ def _synthetic_jpeg(seq: int, width: int = 640, height: int = 480) -> bytes:
 
 def _webcam_jpeg(cap, width: int = 640, height: int = 480) -> Optional[bytes]:
     """Capture one JPEG frame from an OpenCV VideoCapture."""
-    import cv2  # imported lazily so the script works without opencv
+    import cv2
 
     ret, frame = cap.read()
     if not ret:
@@ -138,35 +138,51 @@ async def start_job(
     *,
     model_id: str = "noop",
     params: Optional[dict] = None,
-    orchestrator_url: Optional[str] = None,
+    max_retries: int = 10,
 ) -> dict:
-    """POST /start-job — create a new AI inference job."""
+    """POST /start-job — create a new AI inference job.
+
+    The server handles orchestrator selection and signing.
+    The client only needs to specify the model.
+    Retries on 500 errors (e.g. cold-start orchestrator failures).
+    """
     body: dict = {"model_id": model_id}
     if params:
         body["params"] = params
-    if orchestrator_url:
-        body["orchestrator_url"] = orchestrator_url
 
-    async with session.post(
-        f"{server}/start-job",
-        headers=_headers(api_key),
-        json=body,
-    ) as resp:
-        if resp.status == 429:
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        async with session.post(
+            f"{server}/start-job",
+            headers=_headers(api_key),
+            json=body,
+        ) as resp:
+            if resp.status == 429:
+                data = await resp.json()
+                raise RuntimeError(f"Rate limited: {data['error']}")
+            if resp.status >= 500 and attempt < max_retries:
+                data = await resp.json()
+                last_error = data.get("error", str(data))
+                wait = 10
+                _LOG.warning(
+                    "start-job attempt %d/%d failed (%d: %s), retrying in %ds...",
+                    attempt, max_retries, resp.status, last_error, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+            if resp.status >= 400:
+                data = await resp.json()
+                raise RuntimeError(
+                    f"start-job failed ({resp.status}): {data.get('error', data)}"
+                )
             data = await resp.json()
-            raise RuntimeError(f"Rate limited: {data['error']}")
-        resp.raise_for_status()
-        data = await resp.json()
-        _LOG.info(
-            "Job started — id=%s  model=%s",
-            data["job_id"],
-            data["model_id"],
-        )
-        _LOG.info("  publish_url:   %s", data.get("publish_url"))
-        _LOG.info("  subscribe_url: %s", data.get("subscribe_url"))
-        _LOG.info("  control_url:   %s", data.get("control_url"))
-        _LOG.info("  events_url:    %s", data.get("events_url"))
-        return data
+            _LOG.info("Job started — id=%s  model=%s", data["job_id"], data["model_id"])
+            for field in ("publish_url", "subscribe_url", "control_url", "events_url"):
+                if data.get(field):
+                    _LOG.info("  %-15s %s", field + ":", data[field])
+            return data
+
+    raise RuntimeError(f"start-job failed after {max_retries} attempts: {last_error}")
 
 
 async def get_job(
@@ -180,7 +196,11 @@ async def get_job(
         f"{server}/job/{job_id}",
         headers=_headers(api_key),
     ) as resp:
-        resp.raise_for_status()
+        if resp.status >= 400:
+            data = await resp.json()
+            raise RuntimeError(
+                f"get-job failed ({resp.status}): {data.get('error', data)}"
+            )
         return await resp.json()
 
 
@@ -195,7 +215,10 @@ async def stop_job(
         f"{server}/stop-job/{job_id}",
         headers=_headers(api_key),
     ) as resp:
-        resp.raise_for_status()
+        if resp.status >= 400:
+            data = await resp.json()
+            _LOG.warning("stop-job error (%d): %s", resp.status, data.get("error"))
+            return
         _LOG.info("Job stopped: %s", job_id)
 
 
@@ -212,7 +235,10 @@ async def send_control(
         headers=_headers(api_key),
         json={"message": message},
     ) as resp:
-        resp.raise_for_status()
+        if resp.status >= 400:
+            data = await resp.json()
+            _LOG.warning("control error (%d): %s", resp.status, data.get("error"))
+            return
         _LOG.info("Control message sent: %s", json.dumps(message))
 
 
@@ -237,7 +263,9 @@ async def subscribe_events(
             f"{server}/job/{job_id}/events",
             headers=headers,
         ) as resp:
-            resp.raise_for_status()
+            if resp.status >= 400:
+                _LOG.warning("Events endpoint returned %d", resp.status)
+                return
             buffer = ""
             async for chunk in resp.content.iter_any():
                 buffer += chunk.decode("utf-8", errors="replace")
@@ -247,7 +275,7 @@ async def subscribe_events(
                         if line.startswith("data: "):
                             payload = line[len("data: "):]
                             event = json.loads(payload)
-                            _LOG.info("EVENT: %s", json.dumps(event, indent=2))
+                            _LOG.info("EVENT: %s", json.dumps(event))
     except asyncio.CancelledError:
         return
     except Exception:
@@ -294,78 +322,86 @@ async def stream_frames(
     frames_recv = 0
     t_start = time.monotonic()
 
-    async with session.ws_connect(ws_url) as ws:
-        _LOG.info("WebSocket connected")
+    try:
+        async with session.ws_connect(ws_url) as ws:
+            _LOG.info("WebSocket connected")
 
-        # --- Output reader task ---
-        async def _read_output():
-            nonlocal frames_recv
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    frames_recv += 1
-                    if save_dir:
-                        out_path = save_dir / f"frame_{frames_recv:06d}.jpg"
-                        out_path.write_bytes(msg.data)
-                    if frames_recv % 24 == 0:
+            # --- Output reader task ---
+            async def _read_output():
+                nonlocal frames_recv
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        frames_recv += 1
+                        if save_dir:
+                            out_path = save_dir / f"frame_{frames_recv:06d}.jpg"
+                            out_path.write_bytes(msg.data)
+                        if frames_recv % 24 == 0:
+                            elapsed = time.monotonic() - t_start
+                            _LOG.info(
+                                "Recv %d frames  (%.1f recv-fps)  elapsed=%.1fs",
+                                frames_recv,
+                                frames_recv / max(elapsed, 0.001),
+                                elapsed,
+                            )
+                    elif msg.type == aiohttp.WSMsgType.CLOSE:
+                        _LOG.info("WebSocket closed by server: %s", msg.extra)
+                        break
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        _LOG.warning("WebSocket error: %s", ws.exception())
+                        break
+
+            output_task = asyncio.create_task(_read_output())
+
+            # --- Send input frames ---
+            interval = 1.0 / fps
+            total_frames = int(duration * fps)
+
+            try:
+                for seq in range(total_frames):
+                    t0 = time.monotonic()
+
+                    if use_webcam and cap is not None:
+                        jpeg = _webcam_jpeg(cap)
+                        if jpeg is None:
+                            _LOG.warning("Webcam returned no frame, stopping")
+                            break
+                    else:
+                        jpeg = await asyncio.to_thread(_synthetic_jpeg, seq)
+
+                    await ws.send_bytes(jpeg)
+                    frames_sent += 1
+
+                    if frames_sent % 24 == 0:
                         elapsed = time.monotonic() - t_start
                         _LOG.info(
-                            "Recv %d frames  (%.1f recv-fps)  elapsed=%.1fs",
-                            frames_recv,
-                            frames_recv / max(elapsed, 0.001),
-                            elapsed,
+                            "Sent %d frames  (%.1f send-fps)",
+                            frames_sent,
+                            frames_sent / max(elapsed, 0.001),
                         )
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                    break
 
-        output_task = asyncio.create_task(_read_output())
+                    # Pace to target FPS.
+                    dt = time.monotonic() - t0
+                    if dt < interval:
+                        await asyncio.sleep(interval - dt)
 
-        # --- Send input frames ---
-        interval = 1.0 / fps
-        total_frames = int(duration * fps)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                _LOG.info(
+                    "Done sending — %d frames in %.1fs",
+                    frames_sent,
+                    time.monotonic() - t_start,
+                )
 
-        try:
-            for seq in range(total_frames):
-                t0 = time.monotonic()
+            # Give the server a moment to flush remaining output frames.
+            await asyncio.sleep(2.0)
 
-                if use_webcam and cap is not None:
-                    jpeg = _webcam_jpeg(cap)
-                    if jpeg is None:
-                        _LOG.warning("Webcam returned no frame, stopping")
-                        break
-                else:
-                    jpeg = await asyncio.to_thread(_synthetic_jpeg, seq)
+            output_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await output_task
 
-                await ws.send_bytes(jpeg)
-                frames_sent += 1
-
-                if frames_sent % 24 == 0:
-                    elapsed = time.monotonic() - t_start
-                    _LOG.info(
-                        "Sent %d frames  (%.1f send-fps)",
-                        frames_sent,
-                        frames_sent / max(elapsed, 0.001),
-                    )
-
-                # Pace to target FPS.
-                dt = time.monotonic() - t0
-                if dt < interval:
-                    await asyncio.sleep(interval - dt)
-
-        except asyncio.CancelledError:
-            pass
-        finally:
-            _LOG.info(
-                "Done sending — %d frames in %.1fs",
-                frames_sent,
-                time.monotonic() - t_start,
-            )
-
-        # Give the server a moment to flush remaining output frames.
-        await asyncio.sleep(1.0)
-
-        output_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await output_task
+    except aiohttp.WSServerHandshakeError as e:
+        _LOG.error("WebSocket handshake failed (%d): %s", e.status, e.message)
 
     if cap is not None:
         cap.release()
@@ -385,7 +421,11 @@ async def stream_frames(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Sample client for the Livepeer Gateway serverless API.",
+        description=(
+            "Sample client for the Livepeer Gateway serverless API.\n\n"
+            "The server handles orchestrator selection and signing.\n"
+            "This client only needs the gateway URL — just send frames."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -407,11 +447,6 @@ def _parse_args() -> argparse.Namespace:
         "--params",
         default=None,
         help='Model params as JSON string (e.g. \'{"prompt": "oil painting"}\').',
-    )
-    p.add_argument(
-        "--orchestrator",
-        default=None,
-        help="Orchestrator URL override (host:port).",
     )
     p.add_argument(
         "--fps",
@@ -462,14 +497,13 @@ async def main() -> None:
         # 2. List existing jobs
         await list_jobs(session, server, args.api_key)
 
-        # 3. Start a new job
+        # 3. Start a new job (server picks orchestrator, handles signing)
         job = await start_job(
             session,
             server,
             args.api_key,
             model_id=args.model,
             params=params,
-            orchestrator_url=args.orchestrator,
         )
         job_id = job["job_id"]
 
@@ -490,7 +524,6 @@ async def main() -> None:
                 )
 
             # 6. Stream frames over WebSocket
-            #    Send a control message after 2 seconds if requested.
             async def _run_stream():
                 await stream_frames(
                     session,

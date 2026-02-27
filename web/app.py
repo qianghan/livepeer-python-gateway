@@ -192,7 +192,13 @@ async def start_job(
         )
     except Exception as e:
         _LOG.exception("Failed to start job")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        detail: dict = {"error": str(e)}
+        # Include orchestrator rejection details if available.
+        if hasattr(e, "rejections") and e.rejections:
+            detail["rejections"] = [
+                {"url": r.url, "reason": str(r.reason)} for r in e.rejections
+            ]
+        return JSONResponse(detail, status_code=500)
 
     job_id = str(uuid.uuid4())
     _jobs[job_id] = JobState(

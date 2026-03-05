@@ -1,6 +1,7 @@
 from .capabilities import CapabilityId, build_capabilities
 from .channel_reader import ChannelReader, JSONLReader
-from .control import Control, ControlConfig, ControlMode, TimeControl
+from .channel_writer import ChannelWriter, JSONLWriter
+from .control import Control, ControlConfig, ControlMode
 from .errors import LivepeerGatewayError, NoOrchestratorAvailableError, PaymentError
 from .events import Events
 from .media_publish import MediaPublish, MediaPublishConfig
@@ -20,6 +21,7 @@ __all__ = [
     "Control",
     "ControlConfig",
     "ControlMode",
+    "ChannelWriter",
     "CapabilityId",
     "build_capabilities",
     "discover_orchestrators",
@@ -36,6 +38,7 @@ __all__ = [
     "DecodedMediaFrame",
     "ChannelReader",
     "JSONLReader",
+    "JSONLWriter",
     "Events",
     "PaymentSession",
     "SelectionCursor",
@@ -45,7 +48,6 @@ __all__ = [
     "TricklePublisher",
     "SegmentReader",
     "TrickleSubscriber",
-    "TimeControl",
     "VideoDecodedMediaFrame",
 ]
 

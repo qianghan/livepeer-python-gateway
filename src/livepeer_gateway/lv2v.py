@@ -11,7 +11,8 @@ from typing import Any, Optional, Sequence
 
 from . import lp_rpc_pb2
 from .capabilities import CapabilityId, build_capabilities
-from .control import Control, ControlConfig, ControlMode, TimeControl
+from .channel_writer import ChannelWriter, JSONLWriter
+from .control import Control, ControlConfig, ControlMode
 from .errors import (
     LivepeerGatewayError,
     NoOrchestratorAvailableError,
@@ -102,7 +103,7 @@ class LiveVideoToVideo:
     control_url: Optional[str] = None
     events_url: Optional[str] = None
     orchestrator_info: Optional[lp_rpc_pb2.OrchestratorInfo] = None
-    control: Optional[Control | TimeControl] = None
+    control: Optional[ChannelWriter] = None
     events: Optional[Events] = None
     _media: Optional[MediaPublish] = field(default=None, repr=False, compare=False)
     _payment_session: Optional["PaymentSession"] = field(default=None, repr=False, compare=False)
@@ -121,7 +122,7 @@ class LiveVideoToVideo:
         if control_url:
             config = control_config or ControlConfig()
             if config.mode == ControlMode.TIME:
-                control = TimeControl(control_url, segment_interval=config.segment_interval)
+                control = JSONLWriter(control_url, segment_interval=config.segment_interval)
             else:
                 control = Control(control_url)
         publish_url = data.get("publish_url") if isinstance(data.get("publish_url"), str) else None
@@ -234,7 +235,7 @@ class LiveVideoToVideo:
             payment_task.cancel()
             tasks.append(payment_task)
         if self.control is not None:
-            tasks.append(self.control.close_control())
+            tasks.append(self.control.close())
         if self._media is not None:
             tasks.append(self._media.close())
         if not tasks:

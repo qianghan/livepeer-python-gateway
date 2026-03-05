@@ -77,7 +77,7 @@ async def main() -> None:
             raise ValueError("--message must be a JSON object")
 
         for i in range(max(0, args.count)):
-            await job.control.write_control({**msg, "n": i})
+            await job.control.write({**msg, "n": i})
             if i + 1 < args.count:
                 await asyncio.sleep(args.interval)
 

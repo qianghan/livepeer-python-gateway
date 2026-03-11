@@ -1,4 +1,5 @@
 from .byoc import ByocJobRequest, ByocJobResponse, submit_byoc_job, list_capabilities
+from .job import LivepeerJob, submit_job
 from .capabilities import CapabilityId, build_capabilities
 from .channel_reader import ChannelReader, JSONLReader
 from .channel_writer import ChannelWriter, JSONLWriter
@@ -23,6 +24,8 @@ __all__ = [
     "ByocJobResponse",
     "submit_byoc_job",
     "list_capabilities",
+    "LivepeerJob",
+    "submit_job",
     "Control",
     "ControlConfig",
     "ControlMode",

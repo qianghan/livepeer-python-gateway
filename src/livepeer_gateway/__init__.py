@@ -1,3 +1,4 @@
+from .byoc import ByocJobRequest, ByocJobResponse, submit_byoc_job, list_capabilities
 from .capabilities import CapabilityId, build_capabilities
 from .channel_reader import ChannelReader, JSONLReader
 from .channel_writer import ChannelWriter, JSONLWriter
@@ -18,6 +19,10 @@ from .segment_reader import SegmentReader
 from .trickle_subscriber import TrickleSubscriber
 
 __all__ = [
+    "ByocJobRequest",
+    "ByocJobResponse",
+    "submit_byoc_job",
+    "list_capabilities",
     "Control",
     "ControlConfig",
     "ControlMode",

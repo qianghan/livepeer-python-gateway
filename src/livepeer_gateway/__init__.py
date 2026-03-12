@@ -1,4 +1,8 @@
-from .byoc import ByocJobRequest, ByocJobResponse, submit_byoc_job, list_capabilities
+from .byoc import (
+    ByocJobRequest, ByocJobResponse, submit_byoc_job, list_capabilities,
+    ByocTrainingRequest, ByocTrainingResponse, ByocTrainingStatus,
+    submit_training_job, get_training_status, wait_for_training,
+)
 from .job import LivepeerJob, submit_job
 from .capabilities import CapabilityId, build_capabilities
 from .channel_reader import ChannelReader, JSONLReader
@@ -24,6 +28,12 @@ __all__ = [
     "ByocJobResponse",
     "submit_byoc_job",
     "list_capabilities",
+    "ByocTrainingRequest",
+    "ByocTrainingResponse",
+    "ByocTrainingStatus",
+    "submit_training_job",
+    "get_training_status",
+    "wait_for_training",
     "LivepeerJob",
     "submit_job",
     "Control",

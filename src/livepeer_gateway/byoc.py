@@ -291,6 +291,278 @@ def list_capabilities(
 
 
 # ---------------------------------------------------------------------------
+# Training API
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ByocTrainingRequest:
+    """A BYOC training job request."""
+
+    capability: str
+    """Capability name for the training job."""
+
+    model_id: str
+    """fal.ai model ID for training (e.g. 'fal-ai/flux-lora-fast-training')."""
+
+    params: dict[str, Any] = field(default_factory=dict)
+    """Training parameters (images_data_url, trigger_word, steps, etc.)."""
+
+    timeout_seconds: int = 300
+    """Timeout for the initial submit request (not the training itself)."""
+
+    callback_url: Optional[str] = None
+    """Optional webhook URL for completion notification."""
+
+
+@dataclass
+class ByocTrainingResponse:
+    """Response from a BYOC training job submission."""
+
+    job_id: str
+    """Unique job ID for status polling."""
+
+    status: str = "submitted"
+    """Current status: submitted, running, completed, failed, cancelled."""
+
+    orchestrator_url: Optional[str] = None
+    """The orchestrator handling this job."""
+
+    status_url: Optional[str] = None
+    """Full URL to poll for status."""
+
+    data: Optional[dict] = None
+    """Raw response data."""
+
+    @property
+    def is_done(self) -> bool:
+        return self.status in ("completed", "failed", "cancelled")
+
+
+@dataclass
+class ByocTrainingStatus:
+    """Status of a training job."""
+
+    job_id: str
+    status: str
+    progress: int = 0
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    model_id: Optional[str] = None
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
+    cost: Optional[str] = None
+    """Total cost charged so far (wei)."""
+    balance: Optional[str] = None
+    """Remaining sender balance (wei)."""
+
+    @property
+    def is_done(self) -> bool:
+        return self.status in ("completed", "failed", "cancelled")
+
+    @property
+    def lora_url(self) -> Optional[str]:
+        """Extract LoRA weights URL from completed result."""
+        if not self.result:
+            return None
+        # fal.ai returns diffusers_lora_file.url
+        lora_file = self.result.get("diffusers_lora_file")
+        if isinstance(lora_file, dict):
+            return lora_file.get("url")
+        return self.result.get("lora_url")
+
+    @property
+    def config_url(self) -> Optional[str]:
+        """Extract config file URL from completed result."""
+        if not self.result:
+            return None
+        config_file = self.result.get("config_file")
+        if isinstance(config_file, dict):
+            return config_file.get("url")
+        return None
+
+
+def submit_training_job(
+    req: ByocTrainingRequest,
+    *,
+    orch_url: Optional[Sequence[str] | str] = None,
+    discovery_url: Optional[str] = None,
+    signer_url: Optional[str] = None,
+    signer_headers: Optional[dict[str, str]] = None,
+    discovery_headers: Optional[dict[str, str]] = None,
+    timeout: Optional[float] = None,
+) -> ByocTrainingResponse:
+    """
+    Submit an async training job to the Livepeer BYOC network.
+
+    Returns immediately with a job_id that can be polled for status.
+
+    Args:
+        req: Training request (capability, model_id, params).
+        orch_url: Direct orchestrator URL(s).
+        discovery_url: Discovery endpoint.
+        timeout: HTTP timeout for the submit request.
+
+    Returns:
+        ByocTrainingResponse with job_id and status_url.
+    """
+    job_id = str(uuid.uuid4())
+    http_timeout = timeout or req.timeout_seconds
+
+    orch_list = _resolve_orchestrators(
+        orch_url=orch_url,
+        discovery_url=discovery_url,
+        signer_url=signer_url,
+        signer_headers=signer_headers,
+        discovery_headers=discovery_headers,
+    )
+
+    # Build the Livepeer header (reuse existing infrastructure)
+    byoc_req = ByocJobRequest(
+        capability=req.capability,
+        payload={"model_id": req.model_id, **req.params},
+        timeout_seconds=req.timeout_seconds,
+        job_id=job_id,
+    )
+    livepeer_hdr = _build_livepeer_header(byoc_req, job_id)
+
+    # Build training body
+    body = json.dumps({
+        "model_id": req.model_id,
+        "params": req.params,
+        **({"callback_url": req.callback_url} if req.callback_url else {}),
+    }).encode("utf-8")
+
+    rejections: list[OrchestratorRejection] = []
+
+    for orch in orch_list:
+        orch_origin = _http_origin(orch)
+        url = f"{orch_origin}/process/train/{req.capability}"
+
+        headers = {
+            "Content-Type": "application/json",
+            "Livepeer": livepeer_hdr,
+            "Livepeer-Capability": req.capability,
+        }
+
+        http_req = Request(url, data=body, headers=headers, method="POST")
+        _LOG.info("Training job %s: trying orchestrator %s", job_id, orch_origin)
+
+        try:
+            with urlopen(http_req, timeout=http_timeout, context=_ssl_ctx) as resp:
+                raw_body = resp.read()
+                data = json.loads(raw_body.decode("utf-8"))
+
+                return ByocTrainingResponse(
+                    job_id=data.get("job_id", job_id),
+                    status=data.get("status", "submitted"),
+                    orchestrator_url=orch_origin,
+                    status_url=data.get("status_url"),
+                    data=data,
+                )
+
+        except HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            reason = f"HTTP {e.code}: {err_body}"
+            _LOG.warning("Training job %s: orchestrator %s rejected: %s", job_id, orch_origin, reason)
+
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                raise LivepeerGatewayError(
+                    f"Training job rejected by orchestrator {orch_origin}: {reason}"
+                ) from e
+
+            rejections.append(OrchestratorRejection(url=orch_origin, reason=reason))
+
+        except (URLError, ConnectionRefusedError, TimeoutError, OSError) as e:
+            reason = f"{type(e).__name__}: {e}"
+            _LOG.warning("Training job %s: orchestrator %s unreachable: %s", job_id, orch_origin, reason)
+            rejections.append(OrchestratorRejection(url=orch_origin, reason=reason))
+
+    raise NoOrchestratorAvailableError(rejections=rejections)
+
+
+def get_training_status(
+    job_id: str,
+    orch_url: str,
+    *,
+    timeout: float = 10.0,
+) -> ByocTrainingStatus:
+    """
+    Poll training job status from the orchestrator.
+
+    Args:
+        job_id: The training job ID returned by submit_training_job.
+        orch_url: The orchestrator URL that accepted the job.
+        timeout: HTTP request timeout.
+
+    Returns:
+        ByocTrainingStatus with current status, progress, and result.
+    """
+    orch_origin = _http_origin(orch_url)
+    url = f"{orch_origin}/process/job/{job_id}"
+    http_req = Request(url, headers={"Accept": "application/json"})
+
+    try:
+        with urlopen(http_req, timeout=timeout, context=_ssl_ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return ByocTrainingStatus(
+                job_id=data.get("job_id", job_id),
+                status=data.get("status", "unknown"),
+                progress=data.get("progress", 0),
+                result=data.get("result"),
+                error=data.get("error"),
+                model_id=data.get("model_id"),
+                created_at=data.get("created_at"),
+                updated_at=data.get("updated_at"),
+                cost=data.get("cost"),
+                balance=data.get("balance"),
+            )
+    except HTTPError as e:
+        if e.code == 404:
+            raise LivepeerGatewayError(f"Training job {job_id} not found") from e
+        raise LivepeerGatewayError(f"Status check failed: HTTP {e.code}") from e
+    except Exception as e:
+        raise LivepeerGatewayError(f"Status check failed: {e}") from e
+
+
+def wait_for_training(
+    job_id: str,
+    orch_url: str,
+    *,
+    poll_interval: float = 5.0,
+    timeout: float = 28800.0,
+) -> ByocTrainingStatus:
+    """
+    Poll until a training job completes.
+
+    Args:
+        job_id: The training job ID.
+        orch_url: The orchestrator URL.
+        poll_interval: Seconds between polls.
+        timeout: Maximum wait time in seconds.
+
+    Returns:
+        Final ByocTrainingStatus.
+    """
+    import time
+
+    elapsed = 0.0
+    while elapsed < timeout:
+        status = get_training_status(job_id, orch_url)
+        if status.is_done:
+            return status
+        _LOG.info("Training job %s: status=%s progress=%d%% elapsed=%.0fs",
+                  job_id, status.status, status.progress, elapsed)
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    return get_training_status(job_id, orch_url)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
